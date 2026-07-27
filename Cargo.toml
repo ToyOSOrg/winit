@@ -97,4 +97,4 @@ web-time = "1"
 web_sys = { package = "web-sys", version = "0.3.70" }
 
 [patch.crates-io]
-raw-window-handle = { path = "../raw-window-handle" }
+raw-window-handle = { git = "https://github.com/Japabu/raw-window-handle", branch = "toyos" }
