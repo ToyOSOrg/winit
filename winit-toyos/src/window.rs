@@ -44,7 +44,8 @@ impl Window {
             (1024, 768)
         };
 
-        let toyos_win = toyos_window::Window::create_with_title(w, h, &attrs.title);
+        let toyos_win = toyos_window::Window::create_with_title(w, h, &attrs.title)
+            .map_err(|e| RequestError::Os(os_error!(e)))?;
         let window_id = window_id_from_ptr(&toyos_win);
         let toyos_window = Arc::new(Mutex::new(toyos_win));
 
