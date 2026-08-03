@@ -288,7 +288,7 @@ impl EventLoop {
 
     fn process_key_event<A: ApplicationHandler>(
         window_id: WindowId,
-        key_event: toyos_window::KeyEvent,
+        key_event: toyos_window::KeyPress,
         event_state: &mut EventState,
         window_target: &ActiveEventLoop,
         app: &mut A,
@@ -299,22 +299,21 @@ impl EventLoop {
         let modifiers_before = event_state.keyboard;
         event_state.key(physical_key, pressed);
 
-        // Build logical key from the translated character data.
+        // Build logical key from the characters this press types, which the
+        // window resolved under the layout in force.
         let mut logical_key = Key::Unidentified(NativeKey::Unidentified);
         let mut key_without_modifiers = logical_key.clone();
         let mut text = None;
         let mut text_with_all_modifiers = None;
 
-        if key_event.len > 0 {
-            let len = key_event.len as usize;
-            if let Ok(s) = core::str::from_utf8(&key_event.translated[..len]) {
-                logical_key = Key::Character(SmolStr::new(s));
-                key_without_modifiers =
-                    Key::Character(SmolStr::from_iter(s.chars().flat_map(|c| c.to_lowercase())));
-                if pressed {
-                    text = Some(SmolStr::new(s));
-                    text_with_all_modifiers = Some(SmolStr::new(s));
-                }
+        let typed = key_event.text();
+        if !typed.is_empty() {
+            logical_key = Key::Character(SmolStr::new(typed));
+            key_without_modifiers =
+                Key::Character(SmolStr::from_iter(typed.chars().flat_map(|c| c.to_lowercase())));
+            if pressed {
+                text = Some(SmolStr::new(typed));
+                text_with_all_modifiers = Some(SmolStr::new(typed));
             }
         }
 
@@ -489,9 +488,10 @@ impl EventLoop {
                     };
                     match event_opt {
                         Some(toyos_window::Event::KeyInput(key_event)) => {
+                            let press = win.lock().unwrap().press(key_event);
                             Self::process_key_event(
                                 wid,
-                                key_event,
+                                press,
                                 &mut event_state,
                                 &self.window_target,
                                 &mut app,
@@ -539,6 +539,10 @@ impl EventLoop {
                         },
                         Some(toyos_window::Event::ClipboardPaste(_)) => {
                             // Clipboard paste events are not directly mapped to winit events.
+                        },
+                        Some(toyos_window::Event::LayoutChanged) => {
+                            // The window has already re-read the layout; what a
+                            // key types comes from it on the next press.
                         },
                         None => break,
                     }
@@ -596,9 +600,10 @@ impl EventLoop {
                         if let Some(wid) = current_window_id {
                             match event {
                                 toyos_window::Event::KeyInput(key_event) => {
+                                    let press = win.lock().unwrap().press(key_event);
                                     Self::process_key_event(
                                         wid,
-                                        key_event,
+                                        press,
                                         &mut event_state,
                                         &self.window_target,
                                         &mut app,
@@ -644,6 +649,7 @@ impl EventLoop {
                                     }
                                 },
                                 toyos_window::Event::ClipboardPaste(_) => {},
+                                toyos_window::Event::LayoutChanged => {},
                             }
                         }
                     }
@@ -662,9 +668,10 @@ impl EventLoop {
                                 if let Some(wid) = current_window_id {
                                     match event {
                                         toyos_window::Event::KeyInput(key_event) => {
+                                            let press = win.lock().unwrap().press(key_event);
                                             Self::process_key_event(
                                                 wid,
-                                                key_event,
+                                                press,
                                                 &mut event_state,
                                                 &self.window_target,
                                                 &mut app,
@@ -712,6 +719,7 @@ impl EventLoop {
                                             }
                                         },
                                         toyos_window::Event::ClipboardPaste(_) => {},
+                                        toyos_window::Event::LayoutChanged => {},
                                     }
                                 }
                                 start_cause = StartCause::WaitCancelled {
