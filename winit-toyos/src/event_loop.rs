@@ -528,6 +528,12 @@ impl EventLoop {
                                 wid,
                                 event::WindowEvent::CloseRequested,
                             );
+                            // Close is the last event a window has, so there is
+                            // nothing left to drain. Going round again is what
+                            // kept this loop from reaching the `exiting()` check
+                            // below it, and an application that called `exit()`
+                            // from `CloseRequested` never left.
+                            break;
                         },
                         Some(toyos_window::Event::Frame) => {
                             // Frame events indicate the compositor is ready for a new frame.
