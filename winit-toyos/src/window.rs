@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::iter;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dpi::{PhysicalInsets, PhysicalPosition, PhysicalSize, Position, Size};
@@ -13,15 +14,18 @@ use winit_core::window::{
     WindowId, WindowLevel,
 };
 
-use crate::event_loop::ActiveEventLoop;
+use crate::event_loop::{ActiveEventLoop, queue_redraw};
 
-/// A unique ID derived from the pointer to the underlying ToyOS window.
-fn window_id_from_ptr(win: &toyos_window::Window) -> WindowId {
-    WindowId::from_raw(win as *const toyos_window::Window as usize)
+/// Minted from a process-wide counter: a window's identity is never an address
+/// that a later window could come to occupy.
+fn next_window_id() -> WindowId {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    WindowId::from_raw(NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
 pub struct Window {
     toyos_window: Arc<Mutex<toyos_window::Window>>,
+    waker: toyos_window::Waker,
     redraws: Arc<Mutex<VecDeque<WindowId>>>,
     destroys: Arc<Mutex<VecDeque<WindowId>>>,
     window_id: WindowId,
@@ -46,17 +50,15 @@ impl Window {
 
         let toyos_win = toyos_window::Window::create_with_title(w, h, &attrs.title)
             .map_err(|e| RequestError::Os(os_error!(e)))?;
-        let window_id = window_id_from_ptr(&toyos_win);
+        let window_id = next_window_id();
         let toyos_window = Arc::new(Mutex::new(toyos_win));
 
-        // Notify event loop that this window was created.
-        {
-            let mut creates = el.creates.lock().unwrap();
-            creates.push_back((toyos_window.clone(), window_id));
-        }
+        el.creates.lock().unwrap().push_back((toyos_window.clone(), window_id));
+        el.waker.wake();
 
         Ok(Self {
             toyos_window,
+            waker: el.waker.clone(),
             redraws: el.redraws.clone(),
             destroys: el.destroys.clone(),
             window_id,
@@ -100,11 +102,8 @@ impl CoreWindow for Window {
 
     #[inline]
     fn request_redraw(&self) {
-        let window_id = self.id();
-        let mut redraws = self.redraws.lock().unwrap();
-        if !redraws.contains(&window_id) {
-            redraws.push_back(window_id);
-        }
+        queue_redraw(&self.redraws, self.window_id);
+        self.waker.wake();
     }
 
     #[inline]
@@ -326,10 +325,8 @@ impl rwh_06::HasDisplayHandle for Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
-        {
-            let mut destroys = self.destroys.lock().unwrap();
-            destroys.push_back(self.id());
-        }
+        self.destroys.lock().unwrap().push_back(self.window_id);
+        self.waker.wake();
     }
 }
 

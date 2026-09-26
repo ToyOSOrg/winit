@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::iter;
 
@@ -158,6 +158,18 @@ fn convert_hid_keycode(keycode: u8) -> (PhysicalKey, Option<NamedKey>) {
     (PhysicalKey::Code(key_code), named_key_opt)
 }
 
+/// Pops without holding the lock past the call: the handler the item goes to may push.
+fn pop<T>(queue: &Mutex<VecDeque<T>>) -> Option<T> {
+    queue.lock().unwrap().pop_front()
+}
+
+pub(crate) fn queue_redraw(redraws: &Mutex<VecDeque<WindowId>>, id: WindowId) {
+    let mut redraws = redraws.lock().unwrap();
+    if !redraws.contains(&id) {
+        redraws.push_back(id);
+    }
+}
+
 fn element_state(pressed: bool) -> event::ElementState {
     if pressed { event::ElementState::Pressed } else { event::ElementState::Released }
 }
@@ -253,9 +265,28 @@ impl EventState {
     }
 }
 
+/// A window the loop has been told about and has not yet seen destroyed.
+struct LiveWindow {
+    id: WindowId,
+    window: Arc<Mutex<toyos_window::Window>>,
+    /// The window's connection, which the loop's waiter watches. Live for as
+    /// long as `window` is, which this entry holds.
+    handle: toyos_window::RawHandle,
+    /// `Close` has been delivered: the connection is at its end and stays
+    /// readable, so it is no longer waited on.
+    closed: bool,
+}
+
+impl LiveWindow {
+    /// The next event if one is ready, with the window unlocked again before it is handled.
+    fn poll(&self) -> Option<toyos_window::Event> {
+        self.window.lock().unwrap().poll_event(0)
+    }
+}
+
 pub struct EventLoop {
     window_target: ActiveEventLoop,
-    user_events_receiver: mpsc::Receiver<()>,
+    waiter: toyos_window::Waiter,
 }
 
 impl std::fmt::Debug for EventLoop {
@@ -271,18 +302,22 @@ impl EventLoop {
             return Err(EventLoopError::RecreationAttempt);
         }
 
-        let (user_events_sender, user_events_receiver) = mpsc::sync_channel(1);
+        let waiter = toyos_window::Waiter::new();
 
         Ok(Self {
             window_target: ActiveEventLoop {
                 control_flow: Cell::new(ControlFlow::default()),
                 exit: Cell::new(false),
+                waker: waiter.waker(),
                 creates: Mutex::new(VecDeque::new()),
                 redraws: Arc::new(Mutex::new(VecDeque::new())),
                 destroys: Arc::new(Mutex::new(VecDeque::new())),
-                event_loop_proxy: Arc::new(EventLoopProxy { user_events_sender }),
+                event_loop_proxy: Arc::new(EventLoopProxy {
+                    woken: AtomicBool::new(false),
+                    waker: waiter.waker(),
+                }),
             },
-            user_events_receiver,
+            waiter,
         })
     }
 
@@ -429,141 +464,114 @@ impl EventLoop {
         }
     }
 
+    fn process_event<A: ApplicationHandler>(
+        live: &mut LiveWindow,
+        toyos_event: toyos_window::Event,
+        event_state: &mut EventState,
+        window_target: &ActiveEventLoop,
+        app: &mut A,
+    ) {
+        let wid = live.id;
+        match toyos_event {
+            toyos_window::Event::KeyInput(key_event) => {
+                let press = live.window.lock().unwrap().press(key_event);
+                Self::process_key_event(wid, press, event_state, window_target, app);
+            },
+            toyos_window::Event::MouseInput(mouse_event) => {
+                Self::process_mouse_event(wid, mouse_event, event_state, window_target, app);
+            },
+            toyos_window::Event::Resized => {
+                let (w, h) = {
+                    let w = live.window.lock().unwrap();
+                    (w.width(), w.height())
+                };
+                app.window_event(
+                    window_target,
+                    wid,
+                    event::WindowEvent::SurfaceResized((w, h).into()),
+                );
+                queue_redraw(&window_target.redraws, wid);
+            },
+            toyos_window::Event::Close => {
+                live.closed = true;
+                app.window_event(window_target, wid, event::WindowEvent::CloseRequested);
+            },
+            // The compositor is ready for the next frame.
+            toyos_window::Event::Frame => queue_redraw(&window_target.redraws, wid),
+            // Clipboard paste events are not directly mapped to winit events.
+            toyos_window::Event::ClipboardPaste(_) => {},
+            // The window has already re-read the layout; what a key types
+            // comes from it on the next press.
+            toyos_window::Event::LayoutChanged => {},
+        }
+    }
+
+    /// Work the loop already has, which no wait may hold back: a redraw
+    /// requested from `about_to_wait`, or a window created or dropped in a
+    /// handler after its queue was drained, which cannot be waited on until it
+    /// is.
+    fn has_pending(&self) -> bool {
+        let target = &self.window_target;
+        !target.redraws.lock().unwrap().is_empty()
+            || !target.creates.lock().unwrap().is_empty()
+            || !target.destroys.lock().unwrap().is_empty()
+    }
+
     pub fn run_app_on_demand<A: ApplicationHandler>(
         &mut self,
         mut app: A,
     ) -> Result<(), EventLoopError> {
         let mut start_cause = StartCause::Init;
         let mut event_state = EventState::default();
-        // We use a raw pointer as the window ID. The actual pointer value is stable for a window's
-        // lifetime, so this is fine. We keep a reference to the Window to poll events.
-        let mut toyos_window: Option<Arc<Mutex<toyos_window::Window>>> = None;
-        let mut current_window_id: Option<WindowId> = None;
+        let mut windows: Vec<LiveWindow> = Vec::new();
 
         loop {
+            // Taken before anything a wake announces is read, so a wake raised
+            // after this is still pending at the next wait.
+            self.waiter.take_wake();
+
             app.new_events(&self.window_target, start_cause);
 
             if start_cause == StartCause::Init {
                 app.can_create_surfaces(&self.window_target);
             }
 
-            // Handle window creates.
-            while let Some((win, wid)) = {
-                let mut creates = self.window_target.creates.lock().unwrap();
-                creates.pop_front()
-            } {
-                toyos_window = Some(win.clone());
-                current_window_id = Some(wid);
-
-                let (w, h) = {
-                    let w = win.lock().unwrap();
-                    (w.width(), w.height())
+            while let Some((window, id)) = pop(&self.window_target.creates) {
+                let (handle, size) = {
+                    let w = window.lock().unwrap();
+                    (w.handle(), (w.width(), w.height()))
                 };
-
+                windows.push(LiveWindow { id, window, handle, closed: false });
                 app.window_event(
                     &self.window_target,
-                    wid,
-                    event::WindowEvent::SurfaceResized((w, h).into()),
+                    id,
+                    event::WindowEvent::SurfaceResized(size.into()),
                 );
             }
 
-            // Handle window destroys.
-            while let Some(destroy_id) = {
-                let mut destroys = self.window_target.destroys.lock().unwrap();
-                destroys.pop_front()
-            } {
-                app.window_event(&self.window_target, destroy_id, event::WindowEvent::Destroyed);
-                if current_window_id == Some(destroy_id) {
-                    toyos_window = None;
-                    current_window_id = None;
+            while let Some(id) = pop(&self.window_target.destroys) {
+                app.window_event(&self.window_target, id, event::WindowEvent::Destroyed);
+                windows.retain(|live| live.id != id);
+            }
+
+            for live in &mut windows {
+                // `poll_event` answers `None` for good once it has handed out `Close`.
+                while let Some(toyos_event) = live.poll() {
+                    Self::process_event(
+                        live,
+                        toyos_event,
+                        &mut event_state,
+                        &self.window_target,
+                        &mut app,
+                    );
                 }
             }
 
-            // Poll events from the ToyOS window.
-            if let (Some(win), Some(wid)) = (&toyos_window, current_window_id) {
-                loop {
-                    let event_opt = {
-                        let mut w = win.lock().unwrap();
-                        w.poll_event(0)
-                    };
-                    match event_opt {
-                        Some(toyos_window::Event::KeyInput(key_event)) => {
-                            let press = win.lock().unwrap().press(key_event);
-                            Self::process_key_event(
-                                wid,
-                                press,
-                                &mut event_state,
-                                &self.window_target,
-                                &mut app,
-                            );
-                        },
-                        Some(toyos_window::Event::MouseInput(mouse_event)) => {
-                            Self::process_mouse_event(
-                                wid,
-                                mouse_event,
-                                &mut event_state,
-                                &self.window_target,
-                                &mut app,
-                            );
-                        },
-                        Some(toyos_window::Event::Resized) => {
-                            let (w, h) = {
-                                let w = win.lock().unwrap();
-                                (w.width(), w.height())
-                            };
-                            app.window_event(
-                                &self.window_target,
-                                wid,
-                                event::WindowEvent::SurfaceResized((w, h).into()),
-                            );
-
-                            let mut redraws = self.window_target.redraws.lock().unwrap();
-                            if !redraws.contains(&wid) {
-                                redraws.push_back(wid);
-                            }
-                        },
-                        Some(toyos_window::Event::Close) => {
-                            app.window_event(
-                                &self.window_target,
-                                wid,
-                                event::WindowEvent::CloseRequested,
-                            );
-                            // Close is the last event a window has, so there is
-                            // nothing left to drain. Going round again is what
-                            // kept this loop from reaching the `exiting()` check
-                            // below it, and an application that called `exit()`
-                            // from `CloseRequested` never left.
-                            break;
-                        },
-                        Some(toyos_window::Event::Frame) => {
-                            // Frame events indicate the compositor is ready for a new frame.
-                            // Request a redraw.
-                            let mut redraws = self.window_target.redraws.lock().unwrap();
-                            if !redraws.contains(&wid) {
-                                redraws.push_back(wid);
-                            }
-                        },
-                        Some(toyos_window::Event::ClipboardPaste(_)) => {
-                            // Clipboard paste events are not directly mapped to winit events.
-                        },
-                        Some(toyos_window::Event::LayoutChanged) => {
-                            // The window has already re-read the layout; what a
-                            // key types comes from it on the next press.
-                        },
-                        None => break,
-                    }
-                }
-            }
-
-            while self.user_events_receiver.try_recv().is_ok() {
+            if self.window_target.event_loop_proxy.woken.swap(false, Ordering::Acquire) {
                 app.proxy_wake_up(&self.window_target);
             }
 
-            // Dispatch redraws.
-            while let Some(window_id) = {
-                let mut redraws = self.window_target.redraws.lock().unwrap();
-                redraws.pop_front()
-            } {
+            while let Some(window_id) = pop(&self.window_target.redraws) {
                 app.window_event(
                     &self.window_target,
                     window_id,
@@ -577,181 +585,33 @@ impl EventLoop {
                 break;
             }
 
-            // If about_to_wait() queued a redraw, dispatch it on the next
-            // iteration instead of blocking. Without this, request_redraw()
-            // under ControlFlow::Wait deadlocks until some unrelated event
-            // arrives on the compositor pipe.
-            if !self.window_target.redraws.lock().unwrap().is_empty() {
+            if self.has_pending() {
                 start_cause = StartCause::Poll;
                 continue;
             }
 
-            match self.window_target.control_flow() {
+            let start = Instant::now();
+            let timeout = match self.window_target.control_flow() {
                 ControlFlow::Poll => {
                     start_cause = StartCause::Poll;
                     continue;
                 },
-                ControlFlow::Wait => {
-                    // Block until the next event arrives.
-                    if let Some(win) = &toyos_window {
-                        let mut w = win.lock().unwrap();
-                        let event = w.recv_event();
-                        // We got an event; put it back by processing it next iteration.
-                        // We need to handle it, so decode and push as needed.
-                        drop(w);
-                        // Process the event we just received immediately by re-entering the loop.
-                        // To avoid complexity, we decode the event here and push a synthetic redraw
-                        // or handle it at the top of the next iteration.
-                        // Actually, we need to handle the blocking event. Let's process it inline.
-                        if let Some(wid) = current_window_id {
-                            match event {
-                                toyos_window::Event::KeyInput(key_event) => {
-                                    let press = win.lock().unwrap().press(key_event);
-                                    Self::process_key_event(
-                                        wid,
-                                        press,
-                                        &mut event_state,
-                                        &self.window_target,
-                                        &mut app,
-                                    );
-                                },
-                                toyos_window::Event::MouseInput(mouse_event) => {
-                                    Self::process_mouse_event(
-                                        wid,
-                                        mouse_event,
-                                        &mut event_state,
-                                        &self.window_target,
-                                        &mut app,
-                                    );
-                                },
-                                toyos_window::Event::Resized => {
-                                    let (w, h) = {
-                                        let w = win.lock().unwrap();
-                                        (w.width(), w.height())
-                                    };
-                                    app.window_event(
-                                        &self.window_target,
-                                        wid,
-                                        event::WindowEvent::SurfaceResized((w, h).into()),
-                                    );
-                                    let mut redraws =
-                                        self.window_target.redraws.lock().unwrap();
-                                    if !redraws.contains(&wid) {
-                                        redraws.push_back(wid);
-                                    }
-                                },
-                                toyos_window::Event::Close => {
-                                    app.window_event(
-                                        &self.window_target,
-                                        wid,
-                                        event::WindowEvent::CloseRequested,
-                                    );
-                                },
-                                toyos_window::Event::Frame => {
-                                    let mut redraws =
-                                        self.window_target.redraws.lock().unwrap();
-                                    if !redraws.contains(&wid) {
-                                        redraws.push_back(wid);
-                                    }
-                                },
-                                toyos_window::Event::ClipboardPaste(_) => {},
-                                toyos_window::Event::LayoutChanged => {},
-                            }
-                        }
-                    }
-                    start_cause = StartCause::WaitCancelled { start: Instant::now(), requested_resume: None };
+                ControlFlow::Wait => None,
+                ControlFlow::WaitUntil(deadline) => Some(deadline.saturating_duration_since(start)),
+            };
+
+            let open = windows.iter().filter(|live| !live.closed).map(|live| live.handle);
+            self.waiter.wait(open, timeout);
+
+            start_cause = match self.window_target.control_flow() {
+                ControlFlow::WaitUntil(deadline) if Instant::now() >= deadline => {
+                    StartCause::ResumeTimeReached { start, requested_resume: deadline }
                 },
-                ControlFlow::WaitUntil(instant) => {
-                    let start = Instant::now();
-                    if let Some(duration) = instant.checked_duration_since(start) {
-                        let timeout_ns = duration.as_nanos() as u64;
-                        if let Some(win) = &toyos_window {
-                            let event_opt = {
-                                let mut w = win.lock().unwrap();
-                                w.poll_event(timeout_ns)
-                            };
-                            if let Some(event) = event_opt {
-                                if let Some(wid) = current_window_id {
-                                    match event {
-                                        toyos_window::Event::KeyInput(key_event) => {
-                                            let press = win.lock().unwrap().press(key_event);
-                                            Self::process_key_event(
-                                                wid,
-                                                press,
-                                                &mut event_state,
-                                                &self.window_target,
-                                                &mut app,
-                                            );
-                                        },
-                                        toyos_window::Event::MouseInput(mouse_event) => {
-                                            Self::process_mouse_event(
-                                                wid,
-                                                mouse_event,
-                                                &mut event_state,
-                                                &self.window_target,
-                                                &mut app,
-                                            );
-                                        },
-                                        toyos_window::Event::Resized => {
-                                            let (w, h) = {
-                                                let w = win.lock().unwrap();
-                                                (w.width(), w.height())
-                                            };
-                                            app.window_event(
-                                                &self.window_target,
-                                                wid,
-                                                event::WindowEvent::SurfaceResized(
-                                                    (w, h).into(),
-                                                ),
-                                            );
-                                            let mut redraws =
-                                                self.window_target.redraws.lock().unwrap();
-                                            if !redraws.contains(&wid) {
-                                                redraws.push_back(wid);
-                                            }
-                                        },
-                                        toyos_window::Event::Close => {
-                                            app.window_event(
-                                                &self.window_target,
-                                                wid,
-                                                event::WindowEvent::CloseRequested,
-                                            );
-                                        },
-                                        toyos_window::Event::Frame => {
-                                            let mut redraws =
-                                                self.window_target.redraws.lock().unwrap();
-                                            if !redraws.contains(&wid) {
-                                                redraws.push_back(wid);
-                                            }
-                                        },
-                                        toyos_window::Event::ClipboardPaste(_) => {},
-                                        toyos_window::Event::LayoutChanged => {},
-                                    }
-                                }
-                                start_cause = StartCause::WaitCancelled {
-                                    start,
-                                    requested_resume: Some(instant),
-                                };
-                            } else {
-                                start_cause = StartCause::ResumeTimeReached {
-                                    start,
-                                    requested_resume: instant,
-                                };
-                            }
-                        } else {
-                            start_cause = StartCause::ResumeTimeReached {
-                                start,
-                                requested_resume: instant,
-                            };
-                        }
-                    } else {
-                        start_cause = StartCause::ResumeTimeReached {
-                            start,
-                            requested_resume: instant,
-                        };
-                    }
+                ControlFlow::WaitUntil(deadline) => {
+                    StartCause::WaitCancelled { start, requested_resume: Some(deadline) }
                 },
-            }
+                _ => StartCause::WaitCancelled { start, requested_resume: None },
+            };
         }
 
         Ok(())
@@ -764,12 +624,16 @@ impl EventLoop {
 
 #[derive(Debug)]
 pub struct EventLoopProxy {
-    user_events_sender: mpsc::SyncSender<()>,
+    /// A `wake_up` the loop has not yet handed to `proxy_wake_up`. Set before
+    /// the waker is raised, and taken after the loop takes its wakes.
+    woken: AtomicBool,
+    waker: toyos_window::Waker,
 }
 
 impl EventLoopProxyProvider for EventLoopProxy {
     fn wake_up(&self) {
-        let _ = self.user_events_sender.try_send(());
+        self.woken.store(true, Ordering::Release);
+        self.waker.wake();
     }
 }
 
@@ -778,6 +642,9 @@ impl Unpin for EventLoopProxy {}
 pub struct ActiveEventLoop {
     control_flow: Cell<ControlFlow>,
     exit: Cell<bool>,
+    /// Ends the loop's wait; every queue below is pushed and then woken, since
+    /// a window may be created, redrawn or dropped from any thread.
+    pub(super) waker: toyos_window::Waker,
     pub(super) creates: Mutex<VecDeque<(Arc<Mutex<toyos_window::Window>>, WindowId)>>,
     pub(super) redraws: Arc<Mutex<VecDeque<WindowId>>>,
     pub(super) destroys: Arc<Mutex<VecDeque<WindowId>>>,
