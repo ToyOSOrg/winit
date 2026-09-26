@@ -335,8 +335,9 @@ impl LiveWindow {
                 send(event::WindowEvent::Resized(self.size()));
                 queue_redraw(redraws, self.id);
             },
-            // The compositor is ready for the next frame.
-            toyos_window::Event::Frame => queue_redraw(redraws, self.id),
+            // The last present reached the panel; a redraw is the application's
+            // to ask for, and turning this into one would redraw forever.
+            toyos_window::Event::Frame => {},
             toyos_window::Event::Close => {
                 self.closed = true;
                 send(event::WindowEvent::CloseRequested);
@@ -521,6 +522,8 @@ impl<T: 'static> EventLoop<T> {
                 },
                 target,
             );
+            // A new window has never been drawn, as an exposed one has not.
+            queue_redraw(&target.p.redraws, id);
         }
 
         while let Some(id) = pop(&target.p.destroys) {
