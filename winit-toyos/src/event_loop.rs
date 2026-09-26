@@ -496,8 +496,9 @@ impl EventLoop {
                 live.closed = true;
                 app.window_event(window_target, wid, event::WindowEvent::CloseRequested);
             },
-            // The compositor is ready for the next frame.
-            toyos_window::Event::Frame => queue_redraw(&window_target.redraws, wid),
+            // The last present reached the panel; a redraw is the application's
+            // to ask for, and turning this into one would redraw forever.
+            toyos_window::Event::Frame => {},
             // Clipboard paste events are not directly mapped to winit events.
             toyos_window::Event::ClipboardPaste(_) => {},
             // The window has already re-read the layout; what a key types
@@ -547,6 +548,8 @@ impl EventLoop {
                     id,
                     event::WindowEvent::SurfaceResized(size.into()),
                 );
+                // A new window has never been drawn, as an exposed one has not.
+                queue_redraw(&self.window_target.redraws, id);
             }
 
             while let Some(id) = pop(&self.window_target.destroys) {
