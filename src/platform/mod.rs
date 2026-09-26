@@ -27,6 +27,7 @@ pub mod x11;
     android_platform,
     x11_platform,
     wayland_platform,
+    toyos_platform,
     docsrs,
 ))]
 pub mod run_on_demand;
@@ -37,6 +38,7 @@ pub mod run_on_demand;
     android_platform,
     x11_platform,
     wayland_platform,
+    toyos_platform,
     docsrs,
 ))]
 pub mod pump_events;
@@ -47,6 +49,7 @@ pub mod pump_events;
     x11_platform,
     wayland_platform,
     orbital_platform,
+    toyos_platform,
     docsrs
 ))]
 pub mod modifier_supplement;

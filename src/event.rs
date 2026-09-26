@@ -982,7 +982,7 @@ pub struct InnerSizeWriter {
 }
 
 impl InnerSizeWriter {
-    #[cfg(not(orbital_platform))]
+    #[cfg(not(any(orbital_platform, toyos_platform)))]
     pub(crate) fn new(new_inner_size: Weak<Mutex<PhysicalSize<u32>>>) -> Self {
         Self { new_inner_size }
     }

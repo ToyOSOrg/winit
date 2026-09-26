@@ -20,6 +20,7 @@ fn main() {
         x11_platform: { all(feature = "x11", free_unix, not(redox)) },
         wayland_platform: { all(feature = "wayland", free_unix, not(redox)) },
         orbital_platform: { redox },
+        toyos_platform: { target_os = "toyos" },
     }
 
     // Winit defined cfgs.
