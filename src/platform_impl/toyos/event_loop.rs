@@ -6,6 +6,7 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
 use bitflags::bitflags;
@@ -255,7 +256,7 @@ impl LiveWindow {
     fn process_event<T: 'static>(
         &mut self,
         toyos_event: toyos_window::Event,
-        redraws: &Mutex<VecDeque<WindowId>>,
+        redraws: &Mutex<Redraws>,
         mut event_handler: impl FnMut(event::Event<T>),
     ) {
         let window_id = RootWindowId(self.id);
@@ -333,11 +334,11 @@ impl LiveWindow {
             },
             toyos_window::Event::Resized => {
                 send(event::WindowEvent::Resized(self.size()));
-                queue_redraw(redraws, self.id);
+                redraws.lock().unwrap().request(self.id);
             },
-            // The last present reached the panel; a redraw is the application's
-            // to ask for, and turning this into one would redraw forever.
-            toyos_window::Event::Frame => {},
+            // The last present reached the panel. A redraw is the application's
+            // to ask for; one it asked for since `pre_present_notify` goes now.
+            toyos_window::Event::Frame => redraws.lock().unwrap().frame(self.id),
             toyos_window::Event::Close => {
                 self.closed = true;
                 send(event::WindowEvent::CloseRequested);
@@ -355,10 +356,69 @@ fn pop<T>(queue: &Mutex<VecDeque<T>>) -> Option<T> {
     queue.lock().unwrap().pop_front()
 }
 
-pub(super) fn queue_redraw(redraws: &Mutex<VecDeque<WindowId>>, id: WindowId) {
-    let mut redraws = redraws.lock().unwrap();
-    if !redraws.contains(&id) {
-        redraws.push_back(id);
+fn pop_redraw(redraws: &Mutex<Redraws>) -> Option<WindowId> {
+    redraws.lock().unwrap().pop()
+}
+
+/// Whether the caller is somewhere other than the loop's thread, where a queue
+/// it pushes is not seen until the loop's wait is woken. On the loop's thread
+/// the push is work [`EventLoop::has_pending`] already finds.
+pub(super) fn off_loop(loop_thread: ThreadId) -> bool {
+    thread::current().id() != loop_thread
+}
+
+/// The redraws the loop owes, and the ones held for a frame event.
+///
+/// A window that called `pre_present_notify` has a present on its way to the
+/// panel. A redraw asked of it before the compositor's frame event says that
+/// present arrived is held until the event, which is what paces an
+/// application that asks for its next frame from inside `RedrawRequested`.
+#[derive(Default)]
+pub(super) struct Redraws {
+    queued: VecDeque<WindowId>,
+    presenting: Vec<WindowId>,
+    held: Vec<WindowId>,
+}
+
+impl Redraws {
+    /// Queue a redraw, or hold it for the window's frame event: `true` when it
+    /// was queued, which is when the loop has new work.
+    pub(super) fn request(&mut self, id: WindowId) -> bool {
+        if self.presenting.contains(&id) {
+            if !self.held.contains(&id) {
+                self.held.push(id);
+            }
+            return false;
+        }
+        if !self.queued.contains(&id) {
+            self.queued.push_back(id);
+        }
+        true
+    }
+
+    pub(super) fn presenting(&mut self, id: WindowId) {
+        if !self.presenting.contains(&id) {
+            self.presenting.push(id);
+        }
+    }
+
+    fn frame(&mut self, id: WindowId) {
+        self.presenting.retain(|p| *p != id);
+        if let Some(at) = self.held.iter().position(|h| *h == id) {
+            self.held.swap_remove(at);
+            self.request(id);
+        }
+    }
+
+    /// Nothing is delivered for a window once it is dropped.
+    pub(super) fn forget(&mut self, id: WindowId) {
+        self.queued.retain(|q| *q != id);
+        self.presenting.retain(|p| *p != id);
+        self.held.retain(|h| *h != id);
+    }
+
+    fn pop(&mut self) -> Option<WindowId> {
+        self.queued.pop_front()
     }
 }
 
@@ -387,8 +447,9 @@ impl<T: 'static> EventLoop<T> {
                     control_flow: Cell::new(ControlFlow::default()),
                     exit: Cell::new(false),
                     waker: waiter.waker(),
+                    loop_thread: thread::current().id(),
                     creates: Mutex::new(VecDeque::new()),
-                    redraws: Arc::new(Mutex::new(VecDeque::new())),
+                    redraws: Arc::new(Mutex::new(Redraws::default())),
                     destroys: Arc::new(Mutex::new(VecDeque::new())),
                 },
                 _marker: PhantomData,
@@ -448,7 +509,7 @@ impl<T: 'static> EventLoop<T> {
     /// after its queue was drained, which cannot be waited on until it is.
     fn has_pending(&self) -> bool {
         let p = &self.window_target.p;
-        !p.redraws.lock().unwrap().is_empty()
+        !p.redraws.lock().unwrap().queued.is_empty()
             || !p.creates.lock().unwrap().is_empty()
             || !p.destroys.lock().unwrap().is_empty()
     }
@@ -523,7 +584,7 @@ impl<T: 'static> EventLoop<T> {
                 target,
             );
             // A new window has never been drawn, as an exposed one has not.
-            queue_redraw(&target.p.redraws, id);
+            target.p.redraws.lock().unwrap().request(id);
         }
 
         while let Some(id) = pop(&target.p.destroys) {
@@ -535,6 +596,9 @@ impl<T: 'static> EventLoop<T> {
                 target,
             );
             self.windows.retain(|live| live.id != id);
+            // The redraw the create above queued, when the window went in the
+            // same handler it came in.
+            target.p.redraws.lock().unwrap().forget(id);
         }
 
         for live in &mut self.windows {
@@ -548,7 +612,7 @@ impl<T: 'static> EventLoop<T> {
             callback(event::Event::UserEvent(user_event), target);
         }
 
-        while let Some(id) = pop(&target.p.redraws) {
+        while let Some(id) = pop_redraw(&target.p.redraws) {
             callback(
                 event::Event::WindowEvent {
                     window_id: RootWindowId(id),
@@ -575,7 +639,7 @@ impl<T: 'static> EventLoop<T> {
 
 pub struct EventLoopProxy<T: 'static> {
     user_events_sender: mpsc::Sender<T>,
-    waker: toyos_window::Waker,
+    waker: Arc<toyos_window::Waker>,
 }
 
 impl<T> EventLoopProxy<T> {
@@ -599,11 +663,12 @@ impl<T> Unpin for EventLoopProxy<T> {}
 pub struct ActiveEventLoop {
     control_flow: Cell<ControlFlow>,
     exit: Cell<bool>,
-    /// Ends the loop's wait; every queue below is pushed and then woken, since
-    /// a window is `Send` and may be created, redrawn or dropped from any thread.
-    pub(super) waker: toyos_window::Waker,
+    /// Ends the loop's wait. A window is `Send`, so it may be redrawn or dropped
+    /// from a thread other than `loop_thread`, and such a push is woken.
+    pub(super) waker: Arc<toyos_window::Waker>,
+    pub(super) loop_thread: ThreadId,
     pub(super) creates: Mutex<VecDeque<(Arc<Mutex<toyos_window::Window>>, WindowId)>>,
-    pub(super) redraws: Arc<Mutex<VecDeque<WindowId>>>,
+    pub(super) redraws: Arc<Mutex<Redraws>>,
     pub(super) destroys: Arc<Mutex<VecDeque<WindowId>>>,
 }
 

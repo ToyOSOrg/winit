@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::thread::ThreadId;
 
 use crate::cursor::Cursor;
 use crate::dpi::{PhysicalPosition, PhysicalSize, Position, Size};
@@ -7,15 +8,16 @@ use crate::platform_impl::Fullscreen;
 use crate::window::ImePurpose;
 use crate::{error, window};
 
-use super::event_loop::queue_redraw;
+use super::event_loop::{off_loop, Redraws};
 use super::{ActiveEventLoop, MonitorHandle, OsError, WindowId};
 
 pub struct Window {
     toyos_window: Arc<Mutex<toyos_window::Window>>,
     id: WindowId,
     title: String,
-    waker: toyos_window::Waker,
-    redraws: Arc<Mutex<VecDeque<WindowId>>>,
+    waker: Arc<toyos_window::Waker>,
+    loop_thread: ThreadId,
+    redraws: Arc<Mutex<Redraws>>,
     destroys: Arc<Mutex<VecDeque<WindowId>>>,
 }
 
@@ -35,14 +37,16 @@ impl Window {
         let toyos_window = Arc::new(Mutex::new(toyos_window));
         let id = WindowId::next();
 
+        // `el` is the loop's own, so this is on the loop's thread and the
+        // loop finds the window before it next waits.
         el.creates.lock().unwrap().push_back((toyos_window.clone(), id));
-        el.waker.wake();
 
         Ok(Self {
             toyos_window,
             id,
             title: attrs.title,
             waker: el.waker.clone(),
+            loop_thread: el.loop_thread,
             redraws: el.redraws.clone(),
             destroys: el.destroys.clone(),
         })
@@ -83,14 +87,18 @@ impl Window {
 
     #[inline]
     pub fn request_redraw(&self) {
-        queue_redraw(&self.redraws, self.id);
-        self.waker.wake();
+        let queued = self.redraws.lock().unwrap().request(self.id);
+        if queued && off_loop(self.loop_thread) {
+            self.waker.wake();
+        }
     }
 
-    /// The surface that draws into the window presents it; there is nothing to
-    /// do ahead of that.
+    /// A redraw asked for after this waits for the compositor's frame event
+    /// for the present that follows it.
     #[inline]
-    pub fn pre_present_notify(&self) {}
+    pub fn pre_present_notify(&self) {
+        self.redraws.lock().unwrap().presenting(self.id);
+    }
 
     #[inline]
     pub fn reset_dead_keys(&self) {}
@@ -306,7 +314,10 @@ impl Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
+        self.redraws.lock().unwrap().forget(self.id);
         self.destroys.lock().unwrap().push_back(self.id);
-        self.waker.wake();
+        if off_loop(self.loop_thread) {
+            self.waker.wake();
+        }
     }
 }
