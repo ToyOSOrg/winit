@@ -257,10 +257,18 @@ impl LiveWindow {
         &mut self,
         toyos_event: toyos_window::Event,
         redraws: &Mutex<Redraws>,
+        destroys: &Mutex<VecDeque<WindowId>>,
         mut event_handler: impl FnMut(event::Event<T>),
     ) {
-        let window_id = RootWindowId(self.id);
-        let mut send = |event| event_handler(event::Event::WindowEvent { window_id, event });
+        let id = self.id;
+        let window_id = RootWindowId(id);
+        // One ToyOS event may be several winit ones, and a handler may drop
+        // the window between them: a dropped window hears only its `Destroyed`.
+        let mut send = |event| {
+            if !dropped(destroys, id) {
+                event_handler(event::Event::WindowEvent { window_id, event })
+            }
+        };
         let device_id = event::DeviceId(DeviceId);
         match toyos_event {
             toyos_window::Event::KeyInput(key) => {
@@ -333,8 +341,9 @@ impl LiveWindow {
                 other => tracing::warn!("toyos: unknown mouse event type {other}"),
             },
             toyos_window::Event::Resized => {
-                send(event::WindowEvent::Resized(self.size()));
+                // Queued before the handler runs, so a drop inside it forgets it.
                 redraws.lock().unwrap().request(self.id);
+                send(event::WindowEvent::Resized(self.size()));
             },
             // The last present reached the panel. A redraw is the application's
             // to ask for; one it asked for since `pre_present_notify` goes now.
@@ -349,6 +358,11 @@ impl LiveWindow {
             toyos_window::Event::LayoutChanged => {},
         }
     }
+}
+
+/// A window its application dropped since the loop last delivered `Destroyed`.
+fn dropped(destroys: &Mutex<VecDeque<WindowId>>, id: WindowId) -> bool {
+    destroys.lock().unwrap().contains(&id)
 }
 
 /// Pops without holding the lock past the call: the handler the item goes to may push.
@@ -366,6 +380,9 @@ fn pop_redraw(redraws: &Mutex<Redraws>) -> Option<WindowId> {
 pub(super) fn off_loop(loop_thread: ThreadId) -> bool {
     thread::current().id() != loop_thread
 }
+
+/// Windows created since the loop last took its new ones, each with its id.
+pub(super) type Creates = VecDeque<(Arc<Mutex<toyos_window::Window>>, WindowId)>;
 
 /// The redraws the loop owes, and the ones held for a frame event.
 ///
@@ -448,7 +465,7 @@ impl<T: 'static> EventLoop<T> {
                     exit: Cell::new(false),
                     waker: waiter.waker(),
                     loop_thread: thread::current().id(),
-                    creates: Mutex::new(VecDeque::new()),
+                    creates: Arc::new(Mutex::new(VecDeque::new())),
                     redraws: Arc::new(Mutex::new(Redraws::default())),
                     destroys: Arc::new(Mutex::new(VecDeque::new())),
                 },
@@ -603,8 +620,11 @@ impl<T: 'static> EventLoop<T> {
 
         for live in &mut self.windows {
             // `poll_event` answers `None` for good once it has handed out `Close`.
-            while let Some(toyos_event) = live.poll() {
-                live.process_event(toyos_event, &target.p.redraws, |event| callback(event, target));
+            while !dropped(&target.p.destroys, live.id) {
+                let Some(toyos_event) = live.poll() else { break };
+                live.process_event(toyos_event, &target.p.redraws, &target.p.destroys, |event| {
+                    callback(event, target)
+                });
             }
         }
 
@@ -667,7 +687,7 @@ pub struct ActiveEventLoop {
     /// from a thread other than `loop_thread`, and such a push is woken.
     pub(super) waker: Arc<toyos_window::Waker>,
     pub(super) loop_thread: ThreadId,
-    pub(super) creates: Mutex<VecDeque<(Arc<Mutex<toyos_window::Window>>, WindowId)>>,
+    pub(super) creates: Arc<Mutex<Creates>>,
     pub(super) redraws: Arc<Mutex<Redraws>>,
     pub(super) destroys: Arc<Mutex<VecDeque<WindowId>>>,
 }

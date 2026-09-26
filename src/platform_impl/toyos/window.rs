@@ -8,7 +8,7 @@ use crate::platform_impl::Fullscreen;
 use crate::window::ImePurpose;
 use crate::{error, window};
 
-use super::event_loop::{off_loop, Redraws};
+use super::event_loop::{off_loop, Creates, Redraws};
 use super::{ActiveEventLoop, MonitorHandle, OsError, WindowId};
 
 pub struct Window {
@@ -17,6 +17,7 @@ pub struct Window {
     title: String,
     waker: Arc<toyos_window::Waker>,
     loop_thread: ThreadId,
+    creates: Arc<Mutex<Creates>>,
     redraws: Arc<Mutex<Redraws>>,
     destroys: Arc<Mutex<VecDeque<WindowId>>>,
 }
@@ -47,6 +48,7 @@ impl Window {
             title: attrs.title,
             waker: el.waker.clone(),
             loop_thread: el.loop_thread,
+            creates: el.creates.clone(),
             redraws: el.redraws.clone(),
             destroys: el.destroys.clone(),
         })
@@ -314,6 +316,9 @@ impl Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
+        // A window the loop has not taken yet never becomes live: its
+        // connection closes here, and its `Destroyed` is all it hears.
+        self.creates.lock().unwrap().retain(|(_, id)| *id != self.id);
         self.redraws.lock().unwrap().forget(self.id);
         self.destroys.lock().unwrap().push_back(self.id);
         if off_loop(self.loop_thread) {
