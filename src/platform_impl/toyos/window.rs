@@ -27,13 +27,20 @@ impl Window {
         el: &ActiveEventLoop,
         attrs: window::WindowAttributes,
     ) -> Result<Self, error::OsError> {
-        // `0, 0` asks the compositor to choose.
-        let (w, h): (u32, u32) = match attrs.inner_size {
-            Some(size) => size.to_physical::<u32>(1.0).into(),
-            None => (0, 0),
+        // A logical size is converted by the compositor, at the scale it
+        // shows the window at.
+        let size = match attrs.inner_size {
+            Some(Size::Physical(size)) => {
+                toyos_window::Size::Physical { width: size.width, height: size.height }
+            },
+            Some(Size::Logical(size)) => {
+                let size = size.cast::<u32>();
+                toyos_window::Size::Logical { width: size.width, height: size.height }
+            },
+            None => toyos_window::Size::Any,
         };
 
-        let toyos_window = toyos_window::Window::create_with_title(w, h, &attrs.title)
+        let toyos_window = toyos_window::Window::create_with_title(size, &attrs.title)
             .map_err(|e| os_error!(OsError(e)))?;
         let toyos_window = Arc::new(Mutex::new(toyos_window));
         let id = WindowId::next();
@@ -82,9 +89,11 @@ impl Window {
         None
     }
 
+    /// The scale the compositor shows the window at, which its buffer is
+    /// drawn at.
     #[inline]
     pub fn scale_factor(&self) -> f64 {
-        1.0
+        self.toyos_window.lock().unwrap().scale_factor()
     }
 
     #[inline]

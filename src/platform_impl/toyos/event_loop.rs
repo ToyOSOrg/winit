@@ -240,12 +240,18 @@ struct LiveWindow {
     /// `Close` has been delivered: the connection is at its end and stays
     /// readable, so it is no longer waited on.
     closed: bool,
+    /// The scale the application last heard.
+    scale: f64,
 }
 
 impl LiveWindow {
     fn size(&self) -> PhysicalSize<u32> {
         let w = self.window.lock().unwrap();
         PhysicalSize::new(w.width(), w.height())
+    }
+
+    fn scale_factor(&self) -> f64 {
+        self.window.lock().unwrap().scale_factor()
     }
 
     /// The next event if one is ready, with the window unlocked again before it is handled.
@@ -340,10 +346,24 @@ impl LiveWindow {
                 }),
                 other => tracing::warn!("toyos: unknown mouse event type {other}"),
             },
+            // A new size, a new scale, or both: the scale first, as every
+            // backend says it, then the size the compositor already gave the
+            // buffer. The compositor decides a window's size, so what the
+            // handler writes to `inner_size_writer` is not asked for.
             toyos_window::Event::Resized => {
                 // Queued before the handler runs, so a drop inside it forgets it.
                 redraws.lock().unwrap().request(self.id);
-                send(event::WindowEvent::Resized(self.size()));
+                let size = self.size();
+                let scale_factor = self.scale_factor();
+                if scale_factor != self.scale {
+                    self.scale = scale_factor;
+                    let unasked = Arc::new(Mutex::new(size));
+                    send(event::WindowEvent::ScaleFactorChanged {
+                        scale_factor,
+                        inner_size_writer: event::InnerSizeWriter::new(Arc::downgrade(&unasked)),
+                    });
+                }
+                send(event::WindowEvent::Resized(size));
             },
             // The last present reached the panel. A redraw is the application's
             // to ask for; one it asked for since `pre_present_notify` goes now.
@@ -584,12 +604,14 @@ impl<T: 'static> EventLoop<T> {
 
         while let Some((window, id)) = pop(&target.p.creates) {
             let handle = window.lock().unwrap().handle();
+            let scale = window.lock().unwrap().scale_factor();
             let live = LiveWindow {
                 id,
                 window,
                 handle,
                 keyboard: KeyboardModifierState::default(),
                 closed: false,
+                scale,
             };
             let size = live.size();
             self.windows.push(live);
