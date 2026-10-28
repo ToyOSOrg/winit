@@ -568,7 +568,12 @@ impl<T: 'static> EventLoop<T> {
             min_timeout(control_flow_timeout, timeout)
         };
 
-        let open = self.windows.iter().filter(|live| !live.closed).map(|live| live.handle);
+        let open = self.windows.iter().filter(|live| !live.closed).map(|live| {
+            // SAFETY: `live` holds the window, whose connection the number
+            // names, for as long as the borrow of `self.windows` this lends
+            // for.
+            unsafe { toyos_window::BorrowedHandle::borrow_raw(live.handle) }
+        });
         self.waiter.wait(open, timeout);
 
         let cause = match self.window_target.p.control_flow() {
@@ -603,7 +608,7 @@ impl<T: 'static> EventLoop<T> {
         }
 
         while let Some((window, id)) = pop(&target.p.creates) {
-            let handle = window.lock().unwrap().handle();
+            let handle = window.lock().unwrap().handle().raw();
             let scale = window.lock().unwrap().scale_factor();
             let live = LiveWindow {
                 id,
